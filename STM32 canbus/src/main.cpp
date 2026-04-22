@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <EEPROM.h>
 #include <stdint.h>
 #include <string.h>
 #include <math.h>
@@ -13,6 +14,80 @@
 #ifndef CAN_ALLOW_BOOT_WITHOUT_BUS
 #define CAN_ALLOW_BOOT_WITHOUT_BUS 0
 #endif
+
+/**
+ * Instant fuel for dash `F`/`L` (L/100 km): ECU PW (`actualLastInjection`), static cc/min @ ref ΔP, sequential
+ * 4-stroke (pulses/s ≈ cyl * RPM/120). Optional: subtract injector dead time vs `VBatt` (CAN), scale by
+ * sqrt(ΔP/ΔP_ref) where ΔP ≈ rail_abs(MAP) − MAP (your measured rail vs manifold table in code).
+ * Tune overall with `DASH_FUEL_FLOW_CALIBRATION`. Staged/secondary injectors not modeled.
+ */
+#ifndef DASH_INJECTOR_FLOW_CC_MIN
+#define DASH_INJECTOR_FLOW_CC_MIN 600.0f
+#endif
+#ifndef DASH_ENGINE_CYLINDERS
+#define DASH_ENGINE_CYLINDERS 4u
+#endif
+#ifndef DASH_INJ_PULSES_PER_INJ_PER_CYCLE
+#define DASH_INJ_PULSES_PER_INJ_PER_CYCLE 1.0f
+#endif
+#ifndef DASH_FUEL_FLOW_CALIBRATION
+#define DASH_FUEL_FLOW_CALIBRATION 1.0f
+#endif
+/** Differential pressure (kPa) at which `DASH_INJECTOR_FLOW_CC_MIN` is rated (often ~200…300). */
+#ifndef DASH_INJECTOR_DP_REF_KPA
+#define DASH_INJECTOR_DP_REF_KPA 200.0f
+#endif
+#ifndef DASH_FUEL_USE_VBATT_DEADTIME
+#define DASH_FUEL_USE_VBATT_DEADTIME 1
+#endif
+#ifndef DASH_FUEL_USE_DP_CORRECTION
+#define DASH_FUEL_USE_DP_CORRECTION 1
+#endif
+/** Minimum ΔP (kPa) for sqrt scaling — avoids blow-up if rail model crosses MAP. */
+#ifndef DASH_FUEL_DP_FLOOR_KPA
+#define DASH_FUEL_DP_FLOOR_KPA 40.0f
+#endif
+/** ECU VSS often reads ~1–4 km/h at rest; at/below this speed line `F` is **negative L/h**; above, `F` is L/100 km. */
+#ifndef DASH_INST_FUEL_STANDSTILL_KMH
+#define DASH_INST_FUEL_STANDSTILL_KMH 1.5f
+#endif
+/** Trip average on line `L` = inferred trip fuel / trip distance; require at least this many km or `L` = −1 (ESP shows `--`). */
+#ifndef DASH_TRIP_AVG_MIN_DISTANCE_KM
+#define DASH_TRIP_AVG_MIN_DISTANCE_KM 0.2f
+#endif
+/** Queue trip EEPROM at most once per this distance (km) while moving — avoids flash stalls every few seconds. */
+#ifndef DASH_TRIP_EEPROM_EVERY_KM
+#define DASH_TRIP_EEPROM_EVERY_KM 10.0f
+#endif
+/** After this long stopped (low VSS + low RPM), queue one save (key-off-ish); tune with `-D`. */
+#ifndef DASH_TRIP_EEPROM_PARKED_SAVE_MS
+#define DASH_TRIP_EEPROM_PARKED_SAVE_MS 90000u
+#endif
+
+static float interpolateInjectorDeadtimeMs(float vbattV)
+{
+    if (vbattV <= 8.0f)
+        return 1.76f;
+    if (vbattV >= 15.0f)
+        return 0.64f;
+    if (vbattV <= 10.5f)
+        return 1.76f + (1.14f - 1.76f) * (vbattV - 8.0f) / (10.5f - 8.0f);
+    if (vbattV <= 13.0f)
+        return 1.14f + (0.81f - 1.14f) * (vbattV - 10.5f) / (13.0f - 10.5f);
+    return 0.81f + (0.64f - 0.81f) * (vbattV - 13.0f) / (15.0f - 13.0f);
+}
+
+/** Rail absolute pressure (kPa) vs manifold MAP (kPa abs): 30→2.5 bar, 100→3 bar, 240→4 bar (your log). */
+static float railAbsKpaFromMapKpa(float mapKpaAbs)
+{
+    if (mapKpaAbs <= 30.0f)
+        return 250.0f;
+    if (mapKpaAbs >= 240.0f)
+        return 400.0f;
+    if (mapKpaAbs <= 100.0f)
+        return 250.0f + (300.0f - 250.0f) * (mapKpaAbs - 30.0f) / (100.0f - 30.0f);
+    return 300.0f + (400.0f - 300.0f) * (mapKpaAbs - 100.0f) / (240.0f - 100.0f);
+}
 
 static inline void statusLedSet(bool on)
 {
@@ -308,12 +383,27 @@ static float ecuSpeedKmh = 0.0f;
 /** Speed sent on dash line `V` and used for trip / instant fuel / acceleration — ECU-based; see `updateDashSpeedKmhForDisplay()`. */
 static float dashSpeedKmh = 0.0f;
 static float ecuInjMs = 0.0f;
+/** Live rusEFI output channels for dash telemetry (updated from CAN_ID_VAR_RESPONSE). */
+static float ecuAfr = 14.7f;
+static float ecuMapKpa = 101.3f;
+static float ecuIatC = 25.0f;
+static float ecuCltC = 25.0f;
+static float ecuBaroKpa = 101.3f;
+static float ecuVBatt = 13.0f;
 static bool ecuCruise = false;
 static unsigned long lastDashTelemMs = 0;
 static unsigned long lastCanReqIndex = 0;
-static float avgFuelLPer100 = 0.0f;
+static float avgFuelLPer100 = -1.0f;
 static float tripDistanceKm = 0.0f;
-static unsigned long tripStartMs = 0;
+static float tripFuelLiters = 0.0f;
+/** Trip elapsed time for line `T` (minutes), survives power loss with distance + fuel in EEPROM. */
+static float tripWallMinutes = 0.0f;
+/** Distance (km) at last successful EEPROM flush — rolling saves use `DASH_TRIP_EEPROM_EVERY_KM`. */
+static float trip_persist_anchor_dist = 0.0f;
+static unsigned long trip_park_since_ms = 0u;
+static bool trip_persist_parked_save_done = false;
+/** Trip EEPROM write deferred until RX idle — `EEPROM.put` blocks; never run inside tight telemetry TX. */
+static bool trip_persist_deferred = false;
 
 /** ESP32 dash lines `a`/`b`/`c`/`d`: seconds for 0–60 / 0–100 / 0–120 / 60–120 km/h; negative = no valid sample yet. */
 static const float kAccelStandstillKmh = 1.5f;
@@ -336,6 +426,31 @@ static float accel_s_0_60 = -1.0f;
 static float accel_s_0_100 = -1.0f;
 static float accel_s_0_120 = -1.0f;
 static float accel_s_60_120 = -1.0f;
+
+/**
+ * rusEFI get_var poll sequence (0x700+ecuId → 0x720+ecuId). Each entry is one request per `reqGapMs`.
+ *
+ * Feeds dash UART (`V` speed, `E` RPM, `J`/`X`/`M`/`I`/`C`, `B` boost vs baro, `U` cruise, trip/accel from speed)
+ * and local `OUT_SLOW` GPIO/PWM mirror. Gateway → ECU inputs (ADC, digitals, wheel PPS, buttons, GPS) use
+ * separate set_var bursts — not listed here.
+ *
+ * `VAR_HASH_VEHICLE_SPEED_KMH` is listed twice so `ecuSpeedKmh` / line `V` refresh ~2× as fast as other sensors.
+ */
+static const int32_t kEcuVarPollSeq[] = {
+    VAR_HASH_OUT_SLOW,
+    VAR_HASH_RPM,
+    VAR_HASH_VEHICLE_SPEED_KMH,
+    VAR_HASH_INJECTOR_PW_MS,
+    VAR_HASH_VEHICLE_SPEED_KMH,
+    VAR_HASH_CRUISE_ACTIVE,
+    VAR_HASH_AFR,
+    VAR_HASH_MAP_KPA,
+    VAR_HASH_IAT,
+    VAR_HASH_CLT,
+    VAR_HASH_BARO_KPA,
+    VAR_HASH_VBATT,
+};
+static const uint8_t kEcuVarPollSeqCount = (uint8_t)(sizeof(kEcuVarPollSeq) / sizeof(kEcuVarPollSeq[0]));
 
 static void dashAccelTick(unsigned long now_ms, float sp)
 {
@@ -492,6 +607,92 @@ static inline float readFloat32BigEndian(const uint8_t* in)
     union { float f; uint32_t u; } conv;
     conv.u = ((uint32_t)in[0] << 24) | ((uint32_t)in[1] << 16) | ((uint32_t)in[2] << 8) | (uint32_t)in[3];
     return conv.f;
+}
+
+/** Emulated EEPROM layout (stm32duino): magic + trip distance / fuel / wall minutes. */
+#define TRIP_EEPROM_MAGIC   0x54525034u
+
+static void tripPersistFlush(void)
+{
+    EEPROM.put(0, (uint32_t)TRIP_EEPROM_MAGIC);
+    EEPROM.put(4, tripDistanceKm);
+    EEPROM.put(8, tripFuelLiters);
+    EEPROM.put(12, tripWallMinutes);
+}
+
+/** Run deferred flash save only when ESP32→STM32 UART has nothing pending (avoids multi-second “dead” buttons). */
+static void tripPersistService(void)
+{
+    if (!trip_persist_deferred)
+        return;
+    if (DashSerial.available() > 0)
+        return;
+    tripPersistFlush();
+    trip_persist_deferred = false;
+    trip_persist_anchor_dist = tripDistanceKm;
+}
+
+/** While driving: at most one queued save per `DASH_TRIP_EEPROM_EVERY_KM`. While parked: one save after `DASH_TRIP_EEPROM_PARKED_SAVE_MS` stopped. */
+static void tripPersistScheduleIfDue(unsigned long now, float speed_kmh, float rpm)
+{
+    if (trip_persist_deferred)
+        return;
+    if (tripDistanceKm >= trip_persist_anchor_dist + DASH_TRIP_EEPROM_EVERY_KM) {
+        trip_persist_deferred = true;
+        return;
+    }
+    const bool stopped = (speed_kmh < 1.5f && rpm < 400.0f);
+    if (!stopped) {
+        trip_park_since_ms = 0u;
+        trip_persist_parked_save_done = false;
+        return;
+    }
+    if (trip_park_since_ms == 0u)
+        trip_park_since_ms = now;
+    else if (!trip_persist_parked_save_done && (now - trip_park_since_ms) >= DASH_TRIP_EEPROM_PARKED_SAVE_MS) {
+        trip_persist_deferred = true;
+        trip_persist_parked_save_done = true;
+    }
+}
+
+static void tripPersistLoad(void)
+{
+    uint32_t magic = 0u;
+    EEPROM.get(0, magic);
+    if (magic != TRIP_EEPROM_MAGIC)
+        return;
+    float d = 0.0f, fu = 0.0f, tm = 0.0f;
+    EEPROM.get(4, d);
+    EEPROM.get(8, fu);
+    EEPROM.get(12, tm);
+    if (d < 0.0f || d > 1.0e6f || fu < 0.0f || fu > 1.0e6f || tm < 0.0f || tm > 1.0e8f)
+        return;
+    tripDistanceKm = d;
+    tripFuelLiters = fu;
+    tripWallMinutes = tm;
+    if (tripDistanceKm >= DASH_TRIP_AVG_MIN_DISTANCE_KM) {
+        float tripAvg = (tripFuelLiters / tripDistanceKm) * 100.0f;
+        if (tripAvg < 0.0f) tripAvg = 0.0f;
+        if (tripAvg > 60.0f) tripAvg = 60.0f;
+        avgFuelLPer100 = tripAvg;
+    } else {
+        avgFuelLPer100 = -1.0f;
+    }
+    trip_persist_anchor_dist = tripDistanceKm;
+}
+
+/** Clear trip RAM + EEPROM (call after `S`/`R` is sent to ESP32 so menus / Enter still work on the wire). */
+static void dashTripResetLocal(void)
+{
+    tripDistanceKm = 0.0f;
+    tripFuelLiters = 0.0f;
+    tripWallMinutes = 0.0f;
+    avgFuelLPer100 = -1.0f;
+    lastDashTelemMs = millis();
+    trip_persist_anchor_dist = 0.0f;
+    trip_park_since_ms = 0u;
+    trip_persist_parked_save_done = false;
+    trip_persist_deferred = true;
 }
 
 /** ESP32: `!n`/`@n` — ids 0–2 power (D29–D31), 3–5 extra features (bits 3–5). */
@@ -707,11 +908,15 @@ static void dashButtonTick(DashButtonState& btn, unsigned long nowMs)
         } else if (!btn.longSent && (nowMs - btn.pressStartMs) >= btn.longHoldMs) {
             DashSerial.write((uint8_t)btn.cmdLong);
             DashSerial.flush();
+            if (btn.cmdLong == 'R')
+                dashTripResetLocal();
             btn.longSent = true;
         }
     } else {
         if (btn.pressStartMs != 0u) {
             if (!btn.longSent) {
+                /* Short `S` = ESP32 Enter / menus only — do **not** clear trip here: `dashTripResetLocal()`
+                 * runs EEPROM flush and can block long enough to miss `!`/`@` from Serial2 (power modes stop working). */
                 DashSerial.write((uint8_t)btn.cmdShort);
                 DashSerial.flush();
             }
@@ -746,7 +951,6 @@ static void sendDashStatus(unsigned long now)
 
 static void sendDashTelemetry(unsigned long now)
 {
-    if (tripStartMs == 0u) tripStartMs = now;
     if ((now - lastDashTelemMs) < 200u) return; // ~5Hz
     const unsigned long prev_ms = lastDashTelemMs;
     const float dtHours = (prev_ms == 0u) ? 0.0f : ((float)(now - prev_ms) / 3600000.0f);
@@ -754,32 +958,78 @@ static void sendDashTelemetry(unsigned long now)
 
     // Basic derived signals for ESP32 display fields (speed = ECU VSS, optionally lightly blended toward GPS SOG; see updateDashSpeedKmhForDisplay).
     tripDistanceKm += dashSpeedKmh * dtHours;
+    if (prev_ms != 0u)
+        tripWallMinutes += (float)(now - prev_ms) / 60000.0f;
     const float speed = dashSpeedKmh;
-    const float fuelLph = ecuInjMs * ecuRpm * 0.00045f; // rough synthetic conversion
-    float instL100 = (speed > 1.0f) ? (fuelLph / speed) * 100.0f : 0.0f;
-    if (instL100 < 0.0f) instL100 = 0.0f;
-    if (instL100 > 60.0f) instL100 = 60.0f;
-    if (avgFuelLPer100 <= 0.01f) avgFuelLPer100 = instL100;
-    else avgFuelLPer100 = avgFuelLPer100 * 0.97f + instL100 * 0.03f;
+    float fuelLph = 0.0f;
+    if (ecuRpm > 80.0f && ecuInjMs > 0.02f) {
+        const float pulsesPerSec =
+            (float)DASH_ENGINE_CYLINDERS * DASH_INJ_PULSES_PER_INJ_PER_CYCLE * (ecuRpm / 120.0f);
+        float pwEffMs = ecuInjMs;
+#if DASH_FUEL_USE_VBATT_DEADTIME
+        pwEffMs -= interpolateInjectorDeadtimeMs(ecuVBatt);
+#endif
+        if (pwEffMs < 0.0f)
+            pwEffMs = 0.0f;
+        float dpScale = 1.0f;
+#if DASH_FUEL_USE_DP_CORRECTION
+        {
+            const float railAbs = railAbsKpaFromMapKpa(ecuMapKpa);
+            float deltaPkpa = railAbs - ecuMapKpa;
+            if (deltaPkpa < DASH_FUEL_DP_FLOOR_KPA)
+                deltaPkpa = DASH_FUEL_DP_FLOOR_KPA;
+            const float refDp = DASH_INJECTOR_DP_REF_KPA;
+            if (refDp > 1.0f)
+                dpScale = sqrtf(deltaPkpa / refDp);
+        }
+#endif
+        const float ccPerPulse = (DASH_INJECTOR_FLOW_CC_MIN * pwEffMs / 60000.0f) * dpScale;
+        fuelLph = 3.6f * DASH_FUEL_FLOW_CALIBRATION * pulsesPerSec * ccPerPulse;
+        if (fuelLph < 0.0f) fuelLph = 0.0f;
+        if (fuelLph > 800.0f) fuelLph = 800.0f;
+    }
 
-    const float load = (ecuRpm / 7000.0f);
-    const float boostBar = (load * 1.7f) - 0.7f; // approx -0.7 .. +1.0
-    const float afr = 14.7f - load * 2.6f;
-    const float mapKpa = 28.0f + load * 140.0f;
-    const float iatC = 28.0f + load * 20.0f;
-    const float cltC = 75.0f + load * 15.0f;
-    const float tripMin = (now - tripStartMs) / 60000.0f;
+    tripFuelLiters += fuelLph * dtHours;
 
-    DashSerial.print("F"); DashSerial.println(instL100, 1);
+    /* `F` = momentary L/100 km (fuel rate / speed) when moving, else negative L/h at idle. */
+    const float kStand = DASH_INST_FUEL_STANDSTILL_KMH;
+    float instF_sent = 0.0f;
+    if (speed > kStand) {
+        float instL100 = (fuelLph / speed) * 100.0f;
+        if (instL100 < 0.0f) instL100 = 0.0f;
+        if (instL100 > 60.0f) instL100 = 60.0f;
+        instF_sent = instL100;
+    } else {
+        float lph = fuelLph;
+        if (lph > 40.0f) lph = 40.0f;
+        instF_sent = (lph > 0.0005f) ? -lph : -0.05f;
+    }
+
+    /* `L` = trip average L/100 km (integrated fuel / trip distance), decoupled from instant `F`. */
+    if (tripDistanceKm >= DASH_TRIP_AVG_MIN_DISTANCE_KM) {
+        float tripAvg = (tripFuelLiters / tripDistanceKm) * 100.0f;
+        if (tripAvg < 0.0f) tripAvg = 0.0f;
+        if (tripAvg > 60.0f) tripAvg = 60.0f;
+        avgFuelLPer100 = tripAvg;
+    } else {
+        avgFuelLPer100 = -1.0f;
+    }
+
+    /* Boost gauge (ESP32): bar relative to baro, same sense as many analog boost gauges. */
+    float boostBar = (ecuMapKpa - ecuBaroKpa) / 101.325f;
+    if (boostBar < -1.0f) boostBar = -1.0f;
+    if (boostBar > 2.0f) boostBar = 2.0f;
+    DashSerial.print("F"); DashSerial.println(instF_sent, 1);
     DashSerial.print("D"); DashSerial.println(tripDistanceKm, 1);
-    DashSerial.print("T"); DashSerial.println(tripMin, 0);
+    DashSerial.print("T"); DashSerial.println(tripWallMinutes, 0);
     DashSerial.print("L"); DashSerial.println(avgFuelLPer100, 1);
+    tripPersistScheduleIfDue(now, speed, ecuRpm);
     DashSerial.print("B"); DashSerial.println(boostBar, 1);
     DashSerial.print("J"); DashSerial.println(ecuInjMs, 2);
-    DashSerial.print("X"); DashSerial.println(afr, 2);
-    DashSerial.print("M"); DashSerial.println(mapKpa, 0);
-    DashSerial.print("I"); DashSerial.println(iatC, 0);
-    DashSerial.print("C"); DashSerial.println(cltC, 0);
+    DashSerial.print("X"); DashSerial.println(ecuAfr, 2);
+    DashSerial.print("M"); DashSerial.println(ecuMapKpa, 0);
+    DashSerial.print("I"); DashSerial.println(ecuIatC, 0);
+    DashSerial.print("C"); DashSerial.println(ecuCltC, 0);
     DashSerial.print("V"); DashSerial.println(dashSpeedKmh, 0);
     DashSerial.print("E"); DashSerial.println(ecuRpm, 0);
     const float gpsAgeSec = (gpsLastRxMs == 0u) ? 999.0f : ((now - gpsLastRxMs) / 1000.0f);
@@ -884,6 +1134,8 @@ void setup()
     Serial.println((unsigned long)kGpsBaudOptions[gpsBaudIdx]);
     DashSerial.begin(115200);
     Serial.println(F("Dash UART USART3: RX=PB11 TX=PB10 @115200 — TX->ESP32 GPIO25, RX<-ESP32 GPIO26, GND common"));
+    /* STM32duino: EEPROM.put/get only — no begin(size)/commit(). */
+    tripPersistLoad();
 
     // One medium blink = CAN+BTR OK, accept-all filter on — ready for transceiver + bus
     statusLedPulse(1, 120, 150, 0);
@@ -892,6 +1144,8 @@ void setup()
 void loop()
 {
     unsigned long now = millis();
+    processDashUartCanButtonCommands();
+    tripPersistService();
     gpsTick(now);
     sendGpsToEcuIfNeeded(now);
 
@@ -934,14 +1188,8 @@ void loop()
 
     if (g_can_hw_ok && (now - lastReqMs >= reqGapMs)) {
         lastReqMs = now;
-        // Round-robin ECU requests used by gateway + display.
-        switch (lastCanReqIndex % 5u) {
-            case 0: sendVariableRequestFrame(VAR_HASH_OUT_SLOW, nullptr); break;
-            case 1: sendVariableRequestFrame(VAR_HASH_RPM, nullptr); break;
-            case 2: sendVariableRequestFrame(VAR_HASH_INJECTOR_PW_MS, nullptr); break;
-            case 3: sendVariableRequestFrame(VAR_HASH_VEHICLE_SPEED_KMH, nullptr); break;
-            default: sendVariableRequestFrame(VAR_HASH_CRUISE_ACTIVE, nullptr); break;
-        }
+        const uint8_t pi = (uint8_t)(lastCanReqIndex % (unsigned)kEcuVarPollSeqCount);
+        sendVariableRequestFrame(kEcuVarPollSeq[pi], nullptr);
         lastCanReqIndex++;
     }
 
@@ -1016,6 +1264,18 @@ void loop()
                 ecuSpeedKmh = readFloat32BigEndian(&rx.data[4]);
             } else if (hash == VAR_HASH_CRUISE_ACTIVE) {
                 ecuCruise = readFloat32BigEndian(&rx.data[4]) > 0.5f;
+            } else if (hash == VAR_HASH_AFR) {
+                ecuAfr = readFloat32BigEndian(&rx.data[4]);
+            } else if (hash == VAR_HASH_MAP_KPA) {
+                ecuMapKpa = readFloat32BigEndian(&rx.data[4]);
+            } else if (hash == VAR_HASH_IAT) {
+                ecuIatC = readFloat32BigEndian(&rx.data[4]);
+            } else if (hash == VAR_HASH_CLT) {
+                ecuCltC = readFloat32BigEndian(&rx.data[4]);
+            } else if (hash == VAR_HASH_BARO_KPA) {
+                ecuBaroKpa = readFloat32BigEndian(&rx.data[4]);
+            } else if (hash == VAR_HASH_VBATT) {
+                ecuVBatt = readFloat32BigEndian(&rx.data[4]);
             }
         }
     }
@@ -1076,4 +1336,7 @@ void loop()
             Serial.println((unsigned long)gpsRxByteCount);
         }
     }
+
+    processDashUartCanButtonCommands();
+    tripPersistService();
 }

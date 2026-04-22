@@ -76,6 +76,17 @@ static const int32_t VAR_HASH_INJECTOR_PW_MS = 681043126;    // actualLastInject
 static const int32_t VAR_HASH_VEHICLE_SPEED_KMH = -1925174695; // vehicleSpeedKph
 static const int32_t VAR_HASH_CRUISE_ACTIVE = -450760843;    // cc_engaged
 
+/**
+ * rusEFI `output_lookup_generated.cpp` hashes (standard output channel names).
+ * Must match the ECU bundle if your fork renamed fields; otherwise same as upstream rusEFI.
+ */
+static const int32_t VAR_HASH_AFR = -1093429509;       // AFRValue (lambda*14.7 style AFR)
+static const int32_t VAR_HASH_MAP_KPA = 1281101952;    // MAPValue (kPa absolute typical)
+static const int32_t VAR_HASH_IAT = 81034497;          // intake (deg C)
+static const int32_t VAR_HASH_CLT = -746111499;       // coolant (deg C)
+static const int32_t VAR_HASH_BARO_KPA = -2066867294; // baroPressure (kPa) — boost gauge vs MAP
+static const int32_t VAR_HASH_VBATT = 277722310;       // VBatt (V) — injector dead time for dash fuel math
+
 // GPS variable hashes (compatible with MEGA_EPIC_CANBUS GPS mapping)
 static const int32_t VAR_HASH_GPS_HMSD_PACKED = 703958849;      // Hours, minutes, seconds, days
 static const int32_t VAR_HASH_GPS_MYQSAT_PACKED = -1519914092;  // Months, years, quality, satellites

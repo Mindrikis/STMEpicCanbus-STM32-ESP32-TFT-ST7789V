@@ -34,9 +34,11 @@ USB CDC serial: **115200** (`monitor_speed`). Upload: **DFU** (`upload_protocol 
 
 ## Dash → ESP32 protocol
 
-Newline-terminated ASCII. **Status:** `R0/1`, `U0/1`, `K0/1`. **Telemetry:** `F D T L B J X M I C V E` + **`a b c d`** (accel seconds) + **`Y Z H g`** (GPS alive/fix/sats/“age” = s since last UART byte). **Oil** `W*` not sent — ESP32 reads oil locally.
+Newline-terminated ASCII. **Status:** `R0/1`, `U0/1`, `K0/1`. **Telemetry:** `F D T L B J X M I C V E` + **`a b c d`** (`F` = **momentary** L/100 km when VSS **> ~1.5 km/h** (inferred fuel rate ÷ speed), else negative L/h at idle; `D`/`T`/`L` = trip distance, accumulated trip minutes, trip average L/100 km; **trip persists in EEPROM** across key-off until reset — saves are **rare** while driving (~every **10 km** and after **~90 s** stopped with low VSS/RPM, tunable via `DASH_TRIP_EEPROM_*`), **deferred** until dash UART RX is idle so `EEPROM.put` does not stall the display) (accel seconds) + **`Y Z H g`** (GPS alive/fix/sats/“age” = s since last UART byte). **Oil** `W*` not sent — ESP32 reads oil locally.
 
 **ESP32 → STM32:** `!n` / `@n` (`n` 0–5) for power/extra bits (see `README_PINMAP.md`).
+
+**Dash physical buttons → ESP32:** **Next/Prev** send **`N`/`P`** (short) and **`O`/`Q`** (long). **Reset** sends **`S`** (short) for ESP32 **Enter / menus** (no STM32 trip clear — avoids EEPROM blocking and missing **`!`/`@`** power commands). **Long `R`** sends **`R`** and runs **`dashTripResetLocal()`** (trip RAM clear + **deferred** EEPROM flush when dash RX is idle so buttons / `!`/`@` stay responsive).
 
 ## Source layout
 

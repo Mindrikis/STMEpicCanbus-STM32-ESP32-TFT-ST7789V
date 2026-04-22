@@ -1,0 +1,11 @@
+# Disable WiFi and Bluetooth at ESP-IDF Kconfig level.
+#
+# PlatformIO note: with `framework = arduino` the Arduino-ESP32 package ships
+# prebuilt IDF libraries; this file is NOT merged into that build. It is still
+# useful if you later use ESP-IDF or `framework = arduino, espidf` and set
+# SDKCONFIG_DEFAULTS via CMake (see PlatformIO Espressif 32 docs).
+#
+# Symbols match framework-arduinoespressif32 tools/sdk/esp32/sdkconfig (ESP32).
+
+CONFIG_BT_ENABLED=n
+CONFIG_ESP32_WIFI_ENABLED=n

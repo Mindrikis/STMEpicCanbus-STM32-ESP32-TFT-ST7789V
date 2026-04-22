@@ -13,9 +13,6 @@
  *   - This sketch assumes portrait 240x320 orientation.
  */
 
-#ifndef ARDUINO_LOOP_STACK_SIZE
-#define ARDUINO_LOOP_STACK_SIZE (16 * 1024)
-#endif
 #include <Arduino.h>
 #include <SPI.h>
 #include <Preferences.h>
@@ -25,6 +22,9 @@
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
+#if ARDUINO_ARCH_ESP32 && defined(CONFIG_BT_ENABLED) && CONFIG_BT_ENABLED
+#include "esp_bt.h"
+#endif
 
 // TFT_eSPI manages TFT pins and SPI frequency via its own config.
 // LVGL logical resolution must match the configured TFT size.
@@ -46,11 +46,20 @@
 #ifndef OIL_PRESSURE_SWITCH_PIN
 #define OIL_PRESSURE_SWITCH_PIN  27
 #endif
+/* Coolant / brake: INPUT_PULLUP — open = HIGH = OK; switch/sensor pulls to GND when level low → warn. */
 #ifndef COOLANT_LEVEL_PIN
 #define COOLANT_LEVEL_PIN  13
 #endif
 #ifndef BRAKE_FLUID_PIN
 #define BRAKE_FLUID_PIN  14
+#endif
+/** Coolant + brake fluid warning strip and buzzer chirps. Set via `-D DASH_FLUID_LEVEL_WARNINGS=0` in platformio.ini to disable. */
+#ifndef DASH_FLUID_LEVEL_WARNINGS
+#define DASH_FLUID_LEVEL_WARNINGS  1
+#endif
+/** Oil / fluid pins must read “fault” continuously this long (ms) before overlay + buzzer — avoids glitches from loose wires. */
+#ifndef DASH_SENSOR_FAULT_CONFIRM_MS
+#define DASH_SENSOR_FAULT_CONFIRM_MS  2000u
 #endif
 // Avoid GPIO 5 (VSPI SS); default matches prior working wiring.
 #ifndef BUZZER_PIN
@@ -77,7 +86,7 @@
 #define BUZZER_ACTIVE_HIGH  1
 #endif
 
-// Gateway (Mega or STM32) -> ESP32 Serial2: N/P navigate; O/Q menu; S/R from reset button (short/long).
+// Gateway (Mega or STM32) -> ESP32 Serial2: N/P navigate; O/Q menu; S / R = trip reset (bare R is disambiguated from R0/R1 status).
 // Buttons are GPIO on the gateway only — not on the ESP32.
 // ESP32 -> Mega lines: `!0`..`!5` activate epic id; `@0`..`@5` deactivate (power change sends @old then !new).
 #define CMD_NEXT_PAGE       'N'
@@ -233,6 +242,8 @@ static lv_obj_t *gps_age_val_lbl = NULL;
 #define MAP_GAUGE_MAX_KPA 250.0f
 #define CLT_GAUGE_MAX_C   130.0f
 #define KMH_GAUGE_MAX     300.0f
+#define TAB_IDX_FUEL      0
+#define TAB_IDX_TRIP      1
 #define TAB_IDX_ACCEL     2
 #define TAB_IDX_POWER     3
 #define TAB_IDX_RPM       4
@@ -255,7 +266,8 @@ static lv_obj_t *bottom_panels[3]   = { NULL };
 static lv_obj_t *bottom_icons[3]    = { NULL };
 static lv_obj_t *bottom_captions[3] = { NULL };
 static bool check_warning = true;
-static bool oil_ok = false;
+/** Debounced: assume OK until a fault is confirmed for `DASH_SENSOR_FAULT_CONFIRM_MS`. */
+static bool oil_ok = true;
 static bool cruise_on = false;
 static bool rpm_detected = false;
 static float latest_boost = 0.0f;
@@ -265,6 +277,11 @@ static float latest_afr = 14.7f;
 static float latest_map = 100.0f;
 static float latest_clt = 80.0f;
 static float latest_kmh = 0.0f;
+/** Fuel card: raw `F` from Mega — >=0 instant L/100 km (moving); <0 means instant L/h is `-F` (standstill). Average from `L`. */
+static float latest_F_instant = 0.0f;
+static bool latest_have_F_instant = false;
+static float latest_avg_l100 = 0.0f;
+static bool latest_have_avg_l100 = false;
 static bool gps_alive = false;
 static bool gps_fix = false;
 static uint8_t gps_sats = 0;
@@ -281,8 +298,8 @@ static lv_obj_t *oil_warning_label = NULL;
 static lv_obj_t *fluid_warn_container = NULL;
 static lv_obj_t *fluid_coolant_lbl = NULL;
 static lv_obj_t *fluid_brake_lbl = NULL;
-static bool coolant_level_ok = false;
-static bool brake_fluid_ok = false;
+static bool coolant_level_ok = true;
+static bool brake_fluid_ok = true;
 static bool fluid_sensors_inited = false;
 /** Full-screen oil alert: ST7789 + TFT_BGR reads 0xFF0000 as wrong hue; 0x0000FF reads red on this panel. */
 #define COLOR_OIL_ALERT_BG  lv_color_hex(0x0000FF)
@@ -318,10 +335,41 @@ static void my_disp_flush(lv_display_t *disp, const lv_area_t *area, uint8_t *px
 
 static uint32_t splash_start_ms = 0;
 
+static void refresh_fuel_consumption_card(void)
+{
+  char buf[28];
+  if (fuel_val_lbl) {
+    if (!latest_have_F_instant) {
+      lv_label_set_text_static(fuel_val_lbl, "--");
+      lv_obj_set_style_text_color(fuel_val_lbl, COLOR_TEXT, 0);
+    } else if (latest_F_instant >= 0.0f) {
+      snprintf(buf, sizeof(buf), "%.1f L/100km", (double)latest_F_instant);
+      lv_label_set_text(fuel_val_lbl, buf);
+      lv_obj_set_style_text_color(fuel_val_lbl, COLOR_TEXT, 0);
+    } else {
+      snprintf(buf, sizeof(buf), "%.1f L/h", (double)(-latest_F_instant));
+      lv_label_set_text(fuel_val_lbl, buf);
+      lv_obj_set_style_text_color(fuel_val_lbl, COLOR_TEXT, 0);
+    }
+  }
+  if (fuel_avg_lbl) {
+    if (latest_have_avg_l100) {
+      snprintf(buf, sizeof(buf), "%.1f L/100km", (double)latest_avg_l100);
+      lv_label_set_text(fuel_avg_lbl, buf);
+    } else {
+      lv_label_set_text_static(fuel_avg_lbl, "--");
+    }
+  }
+}
+
 static void reset_trip(void) {
   if (trip_dist_lbl) lv_label_set_text_static(trip_dist_lbl, "0.0 km");
   if (trip_time_lbl) lv_label_set_text_static(trip_time_lbl, "0:00");
   if (trip_avg_lbl)  lv_label_set_text_static(trip_avg_lbl, "-- L/100km");
+  latest_have_avg_l100 = false;
+  latest_have_F_instant = false;
+  latest_F_instant = 0.0f;
+  refresh_fuel_consumption_card();
 }
 
 static lv_obj_t *shadow_label_list[32];
@@ -454,8 +502,9 @@ static void update_aux_sensor_grids(void) {
     const uint8_t metric = aux_metric_for(dash_active_tab, slot);
     if (pwr_name_lbls[slot])
       lv_label_set_text_static(pwr_name_lbls[slot], aux_metric_name(metric));
+    /* Values live in shared aux_text_* buffers that parse_mega_line updates — never two set_text_static to the same buffer. */
     if (power_val_lbl[slot + 1])
-      lv_label_set_text_static(power_val_lbl[slot + 1], aux_metric_value_text(metric));
+      lv_label_set_text(power_val_lbl[slot + 1], aux_metric_value_text(metric));
   }
 }
 
@@ -469,16 +518,17 @@ static void update_gps_monitor_widgets(void) {
     lv_obj_set_style_text_color(gps_fix_val_lbl, gps_fix ? COLOR_CRUISE_ON : COLOR_TOAST_OFF, 0);
   }
   if (gps_sats_val_lbl) {
-    static char b[8];
+    char b[12];
     snprintf(b, sizeof(b), "%u", (unsigned)gps_sats);
-    lv_label_set_text_static(gps_sats_val_lbl, b);
+    lv_label_set_text(gps_sats_val_lbl, b);
   }
   if (gps_age_val_lbl) {
-    static char b[16];
-    if (gps_age_s > 99.0f) lv_label_set_text_static(gps_age_val_lbl, ">99s");
+    if (gps_age_s > 99.0f)
+      lv_label_set_text_static(gps_age_val_lbl, ">99s");
     else {
+      char b[12];
       snprintf(b, sizeof(b), "%.1fs", (double)gps_age_s);
-      lv_label_set_text_static(gps_age_val_lbl, b);
+      lv_label_set_text(gps_age_val_lbl, b);
     }
   }
 }
@@ -655,41 +705,46 @@ static void parse_mega_line(void) {
 
   switch (tag) {
     case 'F':
-      if (fuel_val_lbl) {
-        static char buf[20];
-        snprintf(buf, sizeof(buf), "%.1f L/100km", (double)val);
-        lv_label_set_text_static(fuel_val_lbl, buf);
-      }
+      latest_have_F_instant = true;
+      latest_F_instant = val;
+      refresh_fuel_consumption_card();
       break;
     case 'D':
       if (trip_dist_lbl) {
-        static char buf[20];
-        snprintf(buf, sizeof(buf), "%.1f km", (double)val);
-        lv_label_set_text_static(trip_dist_lbl, buf);
+        char b[20];
+        snprintf(b, sizeof(b), "%.1f km", (double)val);
+        lv_label_set_text(trip_dist_lbl, b);
       }
       break;
     case 'T':
       if (trip_time_lbl) {
-        static char buf[16];
+        char b[12];
         if (strchr(payload, ':') != NULL) {
           int mins = 0, sec = 0;
           sscanf(payload, "%d:%d", &mins, &sec);
-          snprintf(buf, sizeof(buf), "%d:%02d", mins, sec);
-          lv_label_set_text_static(trip_time_lbl, buf);
+          snprintf(b, sizeof(b), "%d:%02d", mins, sec);
         } else {
           int total_mins = (int)val;
-          snprintf(buf, sizeof(buf), "%d:%02d", total_mins / 60, total_mins % 60);
-          lv_label_set_text_static(trip_time_lbl, buf);
+          snprintf(b, sizeof(b), "%d:%02d", total_mins / 60, total_mins % 60);
         }
+        lv_label_set_text(trip_time_lbl, b);
       }
       break;
     case 'L':
-      if (trip_avg_lbl || fuel_avg_lbl) {
-        static char buf[20];
-        snprintf(buf, sizeof(buf), "%.1f L/100km", (double)val);
-        if (trip_avg_lbl)  lv_label_set_text_static(trip_avg_lbl, buf);
-        if (fuel_avg_lbl)  lv_label_set_text_static(fuel_avg_lbl, buf);
+      if (val < 0.0f) {
+        latest_have_avg_l100 = false;
+        if (trip_avg_lbl)
+          lv_label_set_text_static(trip_avg_lbl, "-- L/100km");
+      } else {
+        latest_avg_l100 = val;
+        latest_have_avg_l100 = true;
+        if (trip_avg_lbl) {
+          char b[24];
+          snprintf(b, sizeof(b), "%.1f L/100km", (double)val);
+          lv_label_set_text(trip_avg_lbl, b);
+        }
       }
+      refresh_fuel_consumption_card();
       break;
     case 'B':
       latest_boost = val;
@@ -762,45 +817,45 @@ static void parse_mega_line(void) {
       break;
     case 'a':
       if (accel_val_lbls[0]) {
-        static char abuf[16];
         if (val < 0.0f)
           lv_label_set_text_static(accel_val_lbls[0], "--");
         else {
-          snprintf(abuf, sizeof(abuf), "%.2f s", (double)val);
-          lv_label_set_text_static(accel_val_lbls[0], abuf);
+          char b[16];
+          snprintf(b, sizeof(b), "%.2f s", (double)val);
+          lv_label_set_text(accel_val_lbls[0], b);
         }
       }
       break;
     case 'b':
       if (accel_val_lbls[1]) {
-        static char bbuf[16];
         if (val < 0.0f)
           lv_label_set_text_static(accel_val_lbls[1], "--");
         else {
-          snprintf(bbuf, sizeof(bbuf), "%.2f s", (double)val);
-          lv_label_set_text_static(accel_val_lbls[1], bbuf);
+          char b[16];
+          snprintf(b, sizeof(b), "%.2f s", (double)val);
+          lv_label_set_text(accel_val_lbls[1], b);
         }
       }
       break;
     case 'c':
       if (accel_val_lbls[2]) {
-        static char cbuf[16];
         if (val < 0.0f)
           lv_label_set_text_static(accel_val_lbls[2], "--");
         else {
-          snprintf(cbuf, sizeof(cbuf), "%.2f s", (double)val);
-          lv_label_set_text_static(accel_val_lbls[2], cbuf);
+          char b[16];
+          snprintf(b, sizeof(b), "%.2f s", (double)val);
+          lv_label_set_text(accel_val_lbls[2], b);
         }
       }
       break;
     case 'd':
       if (accel_val_lbls[3]) {
-        static char dbuf[16];
         if (val < 0.0f)
           lv_label_set_text_static(accel_val_lbls[3], "--");
         else {
-          snprintf(dbuf, sizeof(dbuf), "%.2f s", (double)val);
-          lv_label_set_text_static(accel_val_lbls[3], dbuf);
+          char b[16];
+          snprintf(b, sizeof(b), "%.2f s", (double)val);
+          lv_label_set_text(accel_val_lbls[3], b);
         }
       }
       break;
@@ -832,16 +887,33 @@ static void parse_mega_line(void) {
 }
 
 static void poll_oil_pressure_switch(void) {
-  const bool ok = (digitalRead(OIL_PRESSURE_SWITCH_PIN) == LOW);
-  if (ok == oil_ok)
-    return;
-  oil_ok = ok;
-  update_bottom_bar();
-  update_oil_warning_overlay();
+  const uint32_t now_ms = millis();
+  const bool raw_ok = (digitalRead(OIL_PRESSURE_SWITCH_PIN) == LOW);
+  static uint32_t oil_fault_since_ms = 0u;
+  const bool prev = oil_ok;
+
+  if (raw_ok) {
+    oil_fault_since_ms = 0u;
+    oil_ok = true;
+  } else {
+    if (oil_fault_since_ms == 0u)
+      oil_fault_since_ms = now_ms;
+    else if (oil_ok && (now_ms - oil_fault_since_ms >= DASH_SENSOR_FAULT_CONFIRM_MS))
+      oil_ok = false;
+  }
+
+  if (prev != oil_ok) {
+    update_bottom_bar();
+    update_oil_warning_overlay();
+  }
 }
 
 static void update_fluid_warning_strip(void) {
   if (!fluid_warn_container) return;
+#if !DASH_FLUID_LEVEL_WARNINGS
+  lv_obj_add_flag(fluid_warn_container, LV_OBJ_FLAG_HIDDEN);
+  return;
+#endif
   const bool coolant_warn = !coolant_level_ok;
   const bool brake_warn = !brake_fluid_ok;
   if (!coolant_warn && !brake_warn) {
@@ -865,14 +937,42 @@ static void update_fluid_warning_strip(void) {
 }
 
 static void poll_fluid_level_switches(void) {
-  const bool c_ok = (digitalRead(COOLANT_LEVEL_PIN) == LOW);
-  const bool b_ok = (digitalRead(BRAKE_FLUID_PIN) == LOW);
-  if (fluid_sensors_inited && c_ok == coolant_level_ok && b_ok == brake_fluid_ok)
+#if !DASH_FLUID_LEVEL_WARNINGS
+  return;
+#else
+  const uint32_t now_ms = millis();
+  const bool raw_c_ok = (digitalRead(COOLANT_LEVEL_PIN) == HIGH);
+  const bool raw_b_ok = (digitalRead(BRAKE_FLUID_PIN) == HIGH);
+  static uint32_t coolant_fault_since_ms = 0u;
+  static uint32_t brake_fault_since_ms = 0u;
+  const bool prev_c = coolant_level_ok;
+  const bool prev_b = brake_fluid_ok;
+
+  if (raw_c_ok) {
+    coolant_fault_since_ms = 0u;
+    coolant_level_ok = true;
+  } else {
+    if (coolant_fault_since_ms == 0u)
+      coolant_fault_since_ms = now_ms;
+    else if (coolant_level_ok && (now_ms - coolant_fault_since_ms >= DASH_SENSOR_FAULT_CONFIRM_MS))
+      coolant_level_ok = false;
+  }
+
+  if (raw_b_ok) {
+    brake_fault_since_ms = 0u;
+    brake_fluid_ok = true;
+  } else {
+    if (brake_fault_since_ms == 0u)
+      brake_fault_since_ms = now_ms;
+    else if (brake_fluid_ok && (now_ms - brake_fault_since_ms >= DASH_SENSOR_FAULT_CONFIRM_MS))
+      brake_fluid_ok = false;
+  }
+
+  if (fluid_sensors_inited && prev_c == coolant_level_ok && prev_b == brake_fluid_ok)
     return;
   fluid_sensors_inited = true;
-  coolant_level_ok = c_ok;
-  brake_fluid_ok = b_ok;
   update_fluid_warning_strip();
+#endif
 }
 
 static void buzzer_set(bool on) {
@@ -1035,9 +1135,9 @@ static void set_rpm_value(float val) {
   s_rpm_ui_rounded = rounded;
   s_rpm_ui_arc_end = arc_end;
 
-  static char buf[16];
+  char buf[16];
   snprintf(buf, sizeof(buf), "%.0f", (double)val);
-  lv_label_set_text_static(rpm_val_lbl, buf);
+  lv_label_set_text(rpm_val_lbl, buf);
   if (rpm_gauge)
     lv_arc_set_angles(rpm_gauge, 180, arc_end);
 }
@@ -1046,9 +1146,9 @@ static void set_injector_pw_value(float val) {
   if (!inj_val_lbl) return;
   if (val < 0.0f) val = 0.0f;
   if (val > 99.99f) val = 99.99f;
-  static char buf[16];
+  char buf[16];
   snprintf(buf, sizeof(buf), "%.2f", (double)val);
-  lv_label_set_text_static(inj_val_lbl, buf);
+  lv_label_set_text(inj_val_lbl, buf);
   if (inj_gauge) {
     float g = val;
     if (g > INJ_GAUGE_MAX_MS) g = INJ_GAUGE_MAX_MS;
@@ -1059,9 +1159,9 @@ static void set_injector_pw_value(float val) {
 
 static void set_afr_gauge_value(float val) {
   if (!afr_val_lbl) return;
-  static char buf[16];
+  char buf[16];
   snprintf(buf, sizeof(buf), "%.2f", (double)val);
-  lv_label_set_text_static(afr_val_lbl, buf);
+  lv_label_set_text(afr_val_lbl, buf);
   if (afr_gauge) {
     float v = val;
     if (v < AFR_GAUGE_MIN) v = AFR_GAUGE_MIN;
@@ -1074,9 +1174,9 @@ static void set_afr_gauge_value(float val) {
 static void set_map_gauge_value(float val) {
   if (!map_val_lbl) return;
   if (val < 0.0f) val = 0.0f;
-  static char buf[16];
+  char buf[16];
   snprintf(buf, sizeof(buf), "%.0f", (double)val);
-  lv_label_set_text_static(map_val_lbl, buf);
+  lv_label_set_text(map_val_lbl, buf);
   if (map_gauge) {
     float g = val;
     if (g > MAP_GAUGE_MAX_KPA) g = MAP_GAUGE_MAX_KPA;
@@ -1087,9 +1187,9 @@ static void set_map_gauge_value(float val) {
 
 static void set_clt_gauge_value(float val) {
   if (!clt_val_lbl) return;
-  static char buf[16];
+  char buf[16];
   snprintf(buf, sizeof(buf), "%.0f", (double)val);
-  lv_label_set_text_static(clt_val_lbl, buf);
+  lv_label_set_text(clt_val_lbl, buf);
   if (clt_gauge) {
     float g = val;
     if (g < 0.0f) g = 0.0f;
@@ -1103,9 +1203,9 @@ static void set_kmh_value(float val) {
   if (!kmh_val_lbl) return;
   if (val < 0.0f) val = 0.0f;
   if (val > 999.0f) val = 999.0f;
-  static char buf[16];
+  char buf[16];
   snprintf(buf, sizeof(buf), "%.0f", (double)val);
-  lv_label_set_text_static(kmh_val_lbl, buf);
+  lv_label_set_text(kmh_val_lbl, buf);
   if (kmh_gauge) {
     float g = val;
     if (g > KMH_GAUGE_MAX) g = KMH_GAUGE_MAX;
@@ -1116,6 +1216,9 @@ static void set_kmh_value(float val) {
 
 static void refresh_active_gauge_page(void) {
   switch (dash_active_tab) {
+    case TAB_IDX_FUEL:
+      refresh_fuel_consumption_card();
+      break;
     case TAB_IDX_POWER:
       set_boost_value(latest_boost);
       apply_boost_gauge_arc(latest_boost);
@@ -1224,9 +1327,9 @@ static void backlight_flush_nvs_if_due(uint32_t now_ms) {
 
 static void sync_brightness_widgets(void) {
   if (brightness_pct_lbl) {
-    static char b[20];
+    char b[8];
     snprintf(b, sizeof(b), "%u%%", (unsigned)backlight_pct);
-    lv_label_set_text_static(brightness_pct_lbl, b);
+    lv_label_set_text(brightness_pct_lbl, b);
   }
 }
 
@@ -1327,7 +1430,7 @@ static void refresh_extra_active_marks(void) {
   }
 }
 
-/** `!` + digit + newline to gateway. Ids 0–2: power → D29–D31; 3–5: extra features → D35–D37 (gateway). */
+/** `!` + digit + newline to gateway. Ids 0–2: power → D29–D31; 3–5: extra features → D35–D37. */
 static void notify_gateway_epic_button(uint8_t id) {
   Serial2.write('!');
   if (id < 10)
@@ -1558,8 +1661,6 @@ static void drain_ui_cmd_queue(void) {
 }
 
 static void process_mega_commands(void) {
-  /* Drain UART in small chunks so lv_timer_handler() keeps running — a tight while() here
-   * can starve LVGL and watchdog when the gateway sends fast telemetry (e.g. near RPM tab). */
   const int kMaxSerialBytesPerLoop = 96;
   for (int budget = 0; budget < kMaxSerialBytesPerLoop && Serial2.available(); budget++) {
     int c = Serial2.read();
@@ -1569,8 +1670,7 @@ static void process_mega_commands(void) {
 #endif
     uint8_t cmd = (uint8_t)c;
 
-    // Gateway sends RPM as "R0\n" / "R1\n" (STM32 sendDashStatus).
-    // CMD_RESET_TRIP is also bare 'R' from a long button press — disambiguate with peek.
+    /* Trip reset `R` vs RPM status `R0`/`R1`: if next byte is 0 or 1, buffer for line parse; else queue reset. */
     if (cmd == (uint8_t)CMD_RESET_TRIP) {
       int p = Serial2.peek();
       if (p == '0' || p == '1') {
@@ -1580,10 +1680,13 @@ static void process_mega_commands(void) {
           mega_line_len = 0;
         continue;
       }
+      if (splash_finished && main_tabview)
+        enqueue_ui_cmd((uint8_t)CMD_RESET_TRIP);
+      continue;
     }
 
     if (splash_finished && main_tabview) {
-      if (cmd == (uint8_t)CMD_NEXT_PAGE || cmd == (uint8_t)CMD_PREV_PAGE || cmd == (uint8_t)CMD_RESET_TRIP ||
+      if (cmd == (uint8_t)CMD_NEXT_PAGE || cmd == (uint8_t)CMD_PREV_PAGE ||
           cmd == (uint8_t)CMD_OPEN_PWR_OUTPUT || cmd == (uint8_t)CMD_QUIT_PWR_OUTPUT || cmd == (uint8_t)CMD_SELECT_PWR) {
         enqueue_ui_cmd(cmd);
         continue;
@@ -1666,7 +1769,7 @@ static void style_main_page_bg(lv_obj_t *obj) {
   lv_obj_set_style_bg_opa(obj, LV_OPA_COVER, 0);
 }
 
-/** Half-arc + unit in arc center + large value (shared by RPM, Inj PW, AFR, MAP, CLT tabs). */
+/** Half-arc + unit in arc center + large value (shared by RPM, Inj PW, AFR, MAP, CLT, KMH tabs). */
 static void build_rpm_style_gauge_page(lv_obj_t *tab, const char *title, const char *unit_center,
                                        lv_obj_t **gauge_out, lv_obj_t **val_lbl_out,
                                        lv_obj_t **title_main_out, lv_obj_t **title_back_out) {
@@ -1852,7 +1955,6 @@ static void build_ui_dashboard_fuel_trip_accel_power(void) {
   lv_obj_set_style_pad_all(fuel_card, 10, 0);
   lv_obj_remove_flag(fuel_card, LV_OBJ_FLAG_SCROLLABLE);
 
-  // Instant consumption row
   lv_obj_t *fuel_row_inst = lv_obj_create(fuel_card);
   lv_obj_set_size(fuel_row_inst, lv_pct(100), 36);
   lv_obj_align(fuel_row_inst, LV_ALIGN_TOP_MID, 0, 0);
@@ -1871,13 +1973,12 @@ static void build_ui_dashboard_fuel_trip_accel_power(void) {
   fuel_inst_name_lbl = fuel_inst_lbl;
 
   fuel_val_lbl = lv_label_create(fuel_row_inst);
-  lv_label_set_text(fuel_val_lbl, "-- L/100km");
+  lv_label_set_text(fuel_val_lbl, "--");
   lv_obj_set_style_text_font(fuel_val_lbl, &lv_font_montserrat_14, 0);
   lv_obj_set_style_text_color(fuel_val_lbl, COLOR_TEXT, 0);
   lv_obj_align(fuel_val_lbl, LV_ALIGN_RIGHT_MID, 0, 0);
   add_shadow_label(fuel_val_lbl);
 
-  // Average consumption row
   lv_obj_t *fuel_row_avg = lv_obj_create(fuel_card);
   lv_obj_set_size(fuel_row_avg, lv_pct(100), 36);
   lv_obj_align(fuel_row_avg, LV_ALIGN_BOTTOM_MID, 0, 0);
@@ -1896,7 +1997,7 @@ static void build_ui_dashboard_fuel_trip_accel_power(void) {
   fuel_avg_name_lbl = fuel_avg_text;
 
   fuel_avg_lbl = lv_label_create(fuel_row_avg);
-  lv_label_set_text(fuel_avg_lbl, "-- L/100km");
+  lv_label_set_text(fuel_avg_lbl, "--");
   lv_obj_set_style_text_font(fuel_avg_lbl, &lv_font_montserrat_14, 0);
   lv_obj_set_style_text_color(fuel_avg_lbl, COLOR_TEXT, 0);
   lv_obj_align(fuel_avg_lbl, LV_ALIGN_RIGHT_MID, 0, 0);
@@ -2201,16 +2302,10 @@ static void build_main_ui(void) {
     if (ti != 0)
       lv_obj_add_flag(tp, LV_OBJ_FLAG_HIDDEN);
   }
-#if ARDUINO_ARCH_ESP32
-  yield();
-#endif
 
   build_ui_dashboard_fuel_trip_accel_power();
-#if ARDUINO_ARCH_ESP32
-  yield();
   for (int z = 0; z < SPLASH_HANDLER_LOOPS; z++)
     lv_timer_handler();
-#endif
   build_ui_dashboard_gauges_gps_aux();
 
   dash_show_tab(0);
@@ -2552,7 +2647,28 @@ static void create_splash(void) {
   splash_start_ms = millis();
 }
 
+#if ARDUINO_ARCH_ESP32
+/**
+ * Bluetooth: return controller + host BSS to the heap when BT is compiled in but unused.
+ *
+ * WiFi: this sketch never calls `WiFi.begin` / `esp_wifi_init`, so the modem is not used.
+ * We intentionally do not include Arduino `WiFi` or `esp_wifi.h` here — both pull large
+ * WiFi stacks into the link (~150KB+ flash / ~10KB+ DRAM on this toolchain) and this
+ * project is tight on DRAM. To strip WiFi at build time, use ESP-IDF (see sdkconfig.defaults).
+ */
+static void dash_disable_unused_wireless(void)
+{
+#if defined(CONFIG_BT_ENABLED) && CONFIG_BT_ENABLED
+  /* Classic ESP32 core ships `btInUse()==true`, so initArduino() skips mem release — do it here (before any BT init). */
+  (void)esp_bt_mem_release(ESP_BT_MODE_BTDM);
+#endif
+}
+#endif
+
 void setup() {
+#if ARDUINO_ARCH_ESP32
+  dash_disable_unused_wireless();
+#endif
   // USB / UART0: upload and Serial Monitor.
   Serial.begin(115200);
   // Gateway link on UART2 (see MEGA_SER_* pins in file header). RX/TX order is (rxPin, txPin).
@@ -2562,6 +2678,7 @@ void setup() {
 #endif
   Serial2.begin(MEGA_BAUD, SERIAL_8N1, MEGA_SER_RX_PIN, MEGA_SER_TX_PIN);
   pinMode(OIL_PRESSURE_SWITCH_PIN, INPUT_PULLUP);
+#if DASH_FLUID_LEVEL_WARNINGS
 #if (COOLANT_LEVEL_PIN >= 34)
   pinMode(COOLANT_LEVEL_PIN, INPUT);
 #else
@@ -2571,6 +2688,7 @@ void setup() {
   pinMode(BRAKE_FLUID_PIN, INPUT);
 #else
   pinMode(BRAKE_FLUID_PIN, INPUT_PULLUP);
+#endif
 #endif
   pinMode(BUZZER_PIN, OUTPUT);
   buzzer_set(false);

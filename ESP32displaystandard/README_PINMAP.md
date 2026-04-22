@@ -36,13 +36,13 @@ Debug wiring: `-D DASH_LINK_SNIFFER=1` → mirror Serial2 RX to USB `Serial`.
 
 ## Local GPIO (`src/main.cpp`)
 
-Active-low = switch to GND = OK.
+| Function | Default GPIO | Macro | Sense |
+|----------|----------------|--------|--------|
+| Oil pressure OK | 27 | `OIL_PRESSURE_SWITCH_PIN` | Active-**low** = OK (pull to GND when pressure OK) |
+| Coolant level OK | 13 | `COOLANT_LEVEL_PIN` | **HIGH** = OK (internal pull-up; **GND** = low fluid → warning) |
+| Brake fluid OK | 14 | `BRAKE_FLUID_PIN` | Same as coolant |
 
-| Function | Default GPIO | Macro |
-|----------|----------------|--------|
-| Oil pressure OK | 27 | `OIL_PRESSURE_SWITCH_PIN` |
-| Coolant OK | 13 | `COOLANT_LEVEL_PIN` |
-| Brake fluid OK | 14 | `BRAKE_FLUID_PIN` |
+Oil + coolant + brake **warnings** (strip, bottom bar, buzzer) only latch after the pin reads **fault** continuously for **~2 s** (`DASH_SENSOR_FAULT_CONFIRM_MS`, override e.g. `-D DASH_SENSOR_FAULT_CONFIRM_MS=1500`).
 
 ## Buzzer
 

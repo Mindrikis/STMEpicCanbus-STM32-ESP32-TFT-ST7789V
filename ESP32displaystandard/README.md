@@ -23,18 +23,17 @@ If upload fails: disconnect gateway from **GPIO25/26**, stable USB, try `nodemcu
 |-------|------|
 | `Serial2` | Gateway link **115200** RX=`GPIO25` TX=`GPIO26`; `setRxBufferSize` **before** `begin` |
 | `process_mega_commands` | Parses `F D T …` lines + queues `N P O Q S R` for LVGL-safe handling |
-| `main.cpp` UI | Manual tab stack (no `lv_tabview`); menus as overlays; trip reset: **`S`** or **`R`** on dashboard |
+| `main.cpp` UI | Manual tab stack (no `lv_tabview`); menus as overlays; trip reset from gateway **`S`** / **`R`** (bare **`R`** is disambiguated from **`R0`/`R1`** RPM status) |
 | Splash | Full-screen LVGL splash then deferred `build_main_ui()` |
-| Loop stack | `ARDUINO_LOOP_STACK_SIZE` **16 KiB** (before `Arduino.h`) for large LVGL build |
 
 ## Protocol (gateway → ESP32)
 
-Same newline ASCII as STM32 `README.md`: fuel/trip/boost/inj/AFR/MAP/IAT/CLT/speed/RPM, accel **`a–d`**, GPS **`Y Z H g`**, status **`R U K`**.
+Same newline ASCII as STM32 `README.md`: fuel (`F` = momentary L/100 km when moving, else L/h; `L` = trip average L/100 km or **negative** = not enough trip distance yet), trip (`D`/`T`/`L` — trip totals are restored from the gateway after key-on), boost, inj, AFR, MAP, IAT, CLT, speed, RPM, accel **`a–d`**, GPS **`Y Z H g`**, status **`R U K`**.
 
 ## Config
 
 - **Pins / SPI / fonts:** `platformio.ini` `build_flags`
-- **UART, sensors, buzzer, backlight PWM:** `src/main.cpp` `#define`s (or `-D` overrides)
+- **UART, sensors, buzzer, backlight PWM:** `src/main.cpp` `#define`s (or `-D` overrides, including `DASH_SENSOR_FAULT_CONFIRM_MS` for oil/coolant/brake warning delay)
 
 ## Related repo
 

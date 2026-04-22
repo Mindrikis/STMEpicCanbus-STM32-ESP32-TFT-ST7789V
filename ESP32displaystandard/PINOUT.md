@@ -36,7 +36,9 @@ Change `MEGA_SER_RX_PIN` / `MEGA_SER_TX_PIN` only if you use different free GPIO
 
 ## Dashboard buttons (not on the ESP32)
 
-Tact switches live on the **gateway** (Arduino Mega `mega_epic_canbus.ino` or STM32 `STM32 canbus`). The ESP32 only receives **UART** bytes (`N`/`P`/`O`/`Q`/`S`/`R` and newline-terminated status/lines). Wire buttons to the gateway per its `PINOUT.md` / `pinmap.h`.
+Tact switches live on the **gateway** (Arduino Mega `mega_epic_canbus.ino` or STM32 `STM32 canbus`). The ESP32 only receives **UART** bytes (`N`/`P`/`O`/`Q`/`S`/`R` and newline-terminated status/lines). Wire buttons to the gateway per its `README_PINMAP.md` / `pinmap.h`.
+
+Oil / coolant / brake alarms are debounced in firmware: a fault must be stable for about 2 seconds before warnings latch (`DASH_SENSOR_FAULT_CONFIRM_MS`, default `2000u`).
 
 ## TFT_eSPI Values (already chosen)
 
@@ -64,4 +66,3 @@ GPIO19 (MISO, optional) ---------> SDA-0
 ```
 
 **Brightness:** connect `BL` to **GPIO33**; open **Menu** (gateway **O**), choose **Brightness**, use **N** (dimmer) / **P** (brighter), **Q** back. Level is stored in NVS (`dash` / `bl`).
-
